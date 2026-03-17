@@ -1,0 +1,245 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>SRT-Maker</title>
+    <style>
+        * {
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, sans-serif;
+            background: #0f0f0f;
+            color: #e0e0e0;
+            min-height: 100vh;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            padding: 2rem;
+        }
+
+        h1 {
+            font-size: 2.5rem;
+            margin-bottom: 0.5rem;
+            color: #fff;
+        }
+
+        .subtitle {
+            color: #888;
+            margin-bottom: 2rem;
+        }
+
+        .drop-zone {
+            width: 100%;
+            max-width: 500px;
+            padding: 3rem 2rem;
+            border: 2px dashed #333;
+            border-radius: 12px;
+            text-align: center;
+            cursor: pointer;
+            transition: all 0.2s ease;
+            background: #1a1a1a;
+        }
+
+        .drop-zone:hover,
+        .drop-zone.dragover {
+            border-color: #4a9eff;
+            background: #1e2a3a;
+        }
+
+        .drop-zone.processing {
+            pointer-events: none;
+            border-color: #f0a030;
+            background: #2a2518;
+        }
+
+        .drop-zone-icon {
+            font-size: 3rem;
+            margin-bottom: 1rem;
+        }
+
+        .drop-zone-text {
+            font-size: 1.1rem;
+            color: #aaa;
+        }
+
+        .drop-zone-hint {
+            font-size: 0.85rem;
+            color: #666;
+            margin-top: 0.5rem;
+        }
+
+        #file-input {
+            display: none;
+        }
+
+        .status {
+            margin-top: 1.5rem;
+            padding: 1rem 1.5rem;
+            border-radius: 8px;
+            display: none;
+            max-width: 500px;
+            width: 100%;
+        }
+
+        .status.show {
+            display: block;
+        }
+
+        .status.processing {
+            background: #2a2518;
+            color: #f0a030;
+        }
+
+        .status.success {
+            background: #1a2a1a;
+            color: #4ade80;
+        }
+
+        .status.error {
+            background: #2a1a1a;
+            color: #f87171;
+        }
+
+        .spinner {
+            display: inline-block;
+            width: 16px;
+            height: 16px;
+            border: 2px solid #f0a030;
+            border-top-color: transparent;
+            border-radius: 50%;
+            animation: spin 1s linear infinite;
+            margin-right: 8px;
+            vertical-align: middle;
+        }
+
+        @keyframes spin {
+            to { transform: rotate(360deg); }
+        }
+
+        .info {
+            margin-top: 2rem;
+            font-size: 0.8rem;
+            color: #555;
+            text-align: center;
+            max-width: 400px;
+        }
+    </style>
+</head>
+<body>
+    <h1>SRT-Maker</h1>
+    <p class="subtitle">MP3 to SRT transcription</p>
+
+    <div class="drop-zone" id="drop-zone">
+        <div class="drop-zone-icon">📁</div>
+        <div class="drop-zone-text">Drop audio file here or click to browse</div>
+        <div class="drop-zone-hint">MP3, WAV, M4A, OGG, FLAC supported</div>
+    </div>
+
+    <input type="file" id="file-input" accept=".mp3,.wav,.m4a,.ogg,.flac,audio/*">
+
+    <div class="status" id="status"></div>
+
+    <div class="info">
+        Transcribed using faster-whisper large-v3 model with high accuracy settings.
+        Output: 4 words max per subtitle cue, Premiere-compatible SRT.
+    </div>
+
+    <script>
+        const dropZone = document.getElementById('drop-zone');
+        const fileInput = document.getElementById('file-input');
+        const status = document.getElementById('status');
+
+        // Click to browse
+        dropZone.addEventListener('click', () => {
+            if (!dropZone.classList.contains('processing')) {
+                fileInput.click();
+            }
+        });
+
+        // File selected via browser
+        fileInput.addEventListener('change', (e) => {
+            if (e.target.files.length > 0) {
+                handleFile(e.target.files[0]);
+            }
+        });
+
+        // Drag and drop events
+        dropZone.addEventListener('dragover', (e) => {
+            e.preventDefault();
+            dropZone.classList.add('dragover');
+        });
+
+        dropZone.addEventListener('dragleave', () => {
+            dropZone.classList.remove('dragover');
+        });
+
+        dropZone.addEventListener('drop', (e) => {
+            e.preventDefault();
+            dropZone.classList.remove('dragover');
+
+            if (e.dataTransfer.files.length > 0) {
+                handleFile(e.dataTransfer.files[0]);
+            }
+        });
+
+        async function handleFile(file) {
+            // Show processing state
+            dropZone.classList.add('processing');
+            showStatus('processing', `<span class="spinner"></span>Transcribing "${file.name}"... This may take a while.`);
+
+            const formData = new FormData();
+            formData.append('file', file);
+
+            try {
+                const response = await fetch('/transcribe', {
+                    method: 'POST',
+                    body: formData
+                });
+
+                if (!response.ok) {
+                    const error = await response.json();
+                    throw new Error(error.detail || 'Transcription failed');
+                }
+
+                // Get the filename from Content-Disposition header
+                const contentDisposition = response.headers.get('Content-Disposition');
+                let filename = file.name.replace(/\.[^/.]+$/, '') + '.srt';
+                if (contentDisposition) {
+                    const match = contentDisposition.match(/filename="(.+)"/);
+                    if (match) filename = match[1];
+                }
+
+                // Download the file
+                const blob = await response.blob();
+                const url = URL.createObjectURL(blob);
+                const a = document.createElement('a');
+                a.href = url;
+                a.download = filename;
+                document.body.appendChild(a);
+                a.click();
+                document.body.removeChild(a);
+                URL.revokeObjectURL(url);
+
+                showStatus('success', `Done! Downloaded "${filename}"`);
+
+            } catch (error) {
+                showStatus('error', `Error: ${error.message}`);
+            } finally {
+                dropZone.classList.remove('processing');
+                fileInput.value = '';
+            }
+        }
+
+        function showStatus(type, message) {
+            status.className = 'status show ' + type;
+            status.innerHTML = message;
+        }
+    </script>
+</body>
+</html>
