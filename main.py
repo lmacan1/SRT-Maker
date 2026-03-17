@@ -43,63 +43,72 @@ def format_timestamp(seconds: float) -> str:
     return f"{hours:02d}:{minutes:02d}:{secs:02d},{millis:03d}"
 
 
-def split_segment_into_cues(
-    text: str,
-    start_time: float,
-    end_time: float,
-    max_words: int = 4
+def split_words_into_cues(
+    words: List,
+    max_words: int = 3
 ) -> List[Tuple[float, float, str]]:
     """
-    Split a segment into cues with max_words per cue.
-    Timestamps are interpolated proportionally based on word count.
+    Split words into cues with max_words per cue.
+    Uses actual word-level timestamps from faster-whisper.
+    Tries to break at punctuation when possible.
 
     Returns list of (start, end, text) tuples.
     """
-    words = text.strip().split()
     if not words:
         return []
 
-    total_duration = end_time - start_time
-    total_words = len(words)
-
     cues = []
-    word_idx = 0
+    current_words = []
+    current_start = None
 
-    while word_idx < total_words:
-        # Get next chunk of words (up to max_words)
-        chunk_words = words[word_idx:word_idx + max_words]
-        chunk_word_count = len(chunk_words)
+    for word_info in words:
+        word_text = word_info.word.strip()
+        if not word_text:
+            continue
 
-        # Calculate proportional timestamps
-        chunk_start_ratio = word_idx / total_words
-        chunk_end_ratio = (word_idx + chunk_word_count) / total_words
+        if current_start is None:
+            current_start = word_info.start
 
-        chunk_start = start_time + (total_duration * chunk_start_ratio)
-        chunk_end = start_time + (total_duration * chunk_end_ratio)
+        current_words.append(word_text)
+        current_end = word_info.end
 
-        chunk_text = " ".join(chunk_words)
-        cues.append((chunk_start, chunk_end, chunk_text))
+        # Check if we should end the cue
+        should_break = False
 
-        word_idx += chunk_word_count
+        # Break at max words
+        if len(current_words) >= max_words:
+            should_break = True
+
+        # Also break at sentence-ending punctuation if we have at least 2 words
+        if len(current_words) >= 2 and word_text and word_text[-1] in '.!?':
+            should_break = True
+
+        if should_break:
+            cue_text = " ".join(current_words)
+            cues.append((current_start, current_end, cue_text))
+            current_words = []
+            current_start = None
+
+    # Handle remaining words
+    if current_words and current_start is not None:
+        cue_text = " ".join(current_words)
+        cues.append((current_start, current_end, cue_text))
 
     return cues
 
 
 def generate_srt(segments) -> str:
     """
-    Generate SRT content from whisper segments.
-    Splits segments into 3-4 word cues with interpolated timestamps.
+    Generate SRT content from whisper segments with word-level timestamps.
+    Splits into max 3 words per cue with accurate timestamps.
     """
-    all_cues = []
+    all_words = []
 
     for segment in segments:
-        cues = split_segment_into_cues(
-            segment.text,
-            segment.start,
-            segment.end,
-            max_words=4
-        )
-        all_cues.extend(cues)
+        if hasattr(segment, 'words') and segment.words:
+            all_words.extend(segment.words)
+
+    all_cues = split_words_into_cues(all_words, max_words=3)
 
     # Build SRT content
     srt_lines = []
@@ -145,6 +154,7 @@ async def transcribe(file: UploadFile = File(...)):
             beam_size=5,
             best_of=5,
             temperature=0,
+            word_timestamps=True,
             vad_filter=True,
             vad_parameters=dict(
                 min_silence_duration_ms=500,
