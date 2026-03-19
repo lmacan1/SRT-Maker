@@ -3,9 +3,11 @@ SRT-Maker: Web app for transcribing MP3 files to SRT subtitles using faster-whis
 """
 import os
 import uuid
-import tempfile
+import subprocess
 from pathlib import Path
 from typing import List, Tuple
+
+VIDEO_EXTENSIONS = ('.mp4', '.mkv', '.webm', '.mov')
 
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.responses import FileResponse, HTMLResponse
@@ -19,6 +21,15 @@ app.mount("/static", StaticFiles(directory="static"), name="static")
 
 # Initialize model lazily
 _model = None
+
+def extract_audio(video_path: Path, output_path: Path) -> None:
+    """Extract audio from video file using ffmpeg."""
+    subprocess.run([
+        'ffmpeg', '-i', str(video_path),
+        '-vn', '-acodec', 'libmp3lame', '-q:a', '2',
+        '-y', str(output_path)
+    ], check=True, capture_output=True)
+
 
 def get_model() -> WhisperModel:
     """Load the whisper model (lazy initialization)."""
@@ -132,24 +143,35 @@ async def transcribe(file: UploadFile = File(...)):
     """
     Transcribe an uploaded MP3 file and return an SRT file.
     """
-    if not file.filename.lower().endswith(('.mp3', '.wav', '.m4a', '.ogg', '.flac')):
-        raise HTTPException(status_code=400, detail="Please upload an audio file (MP3, WAV, M4A, OGG, FLAC)")
+    if not file.filename.lower().endswith(('.mp3', '.wav', '.m4a', '.ogg', '.flac', '.mp4', '.mkv', '.webm', '.mov')):
+        raise HTTPException(status_code=400, detail="Please upload an audio or video file (MP3, WAV, M4A, OGG, FLAC, MP4, MKV, WebM, MOV)")
 
     # Save uploaded file temporarily
     temp_id = str(uuid.uuid4())
     temp_audio_path = Path("uploads") / f"{temp_id}_{file.filename}"
+
+    extracted_audio_path = None
 
     try:
         # Write uploaded file to disk
         content = await file.read()
         temp_audio_path.write_bytes(content)
 
+        # Extract audio if it's a video file
+        transcribe_path = temp_audio_path
+        if file.filename.lower().endswith(VIDEO_EXTENSIONS):
+            print(f"Extracting audio from: {file.filename}")
+            extracted_audio_path = Path("uploads") / f"{temp_id}_extracted.mp3"
+            extract_audio(temp_audio_path, extracted_audio_path)
+            transcribe_path = extracted_audio_path
+            print("Audio extraction complete")
+
         # Load model and transcribe
         model = get_model()
 
         print(f"Transcribing: {file.filename}")
         segments, info = model.transcribe(
-            str(temp_audio_path),
+            str(transcribe_path),
             language="en",
             beam_size=5,
             best_of=5,
@@ -181,9 +203,11 @@ async def transcribe(file: UploadFile = File(...)):
         )
 
     finally:
-        # Clean up temp audio file
+        # Clean up temp files
         if temp_audio_path.exists():
             temp_audio_path.unlink()
+        if extracted_audio_path and extracted_audio_path.exists():
+            extracted_audio_path.unlink()
 
 
 @app.on_event("startup")
