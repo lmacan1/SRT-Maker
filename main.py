@@ -56,12 +56,17 @@ def format_timestamp(seconds: float) -> str:
 
 def split_words_into_cues(
     words: List,
-    max_words: int = 3
+    min_words: int = 2,
+    max_words: int = 5,
+    pause_threshold: float = 0.3,
 ) -> List[Tuple[float, float, str]]:
     """
-    Split words into cues with max_words per cue.
-    Uses actual word-level timestamps from faster-whisper.
-    Tries to break at punctuation when possible.
+    Split words into cues using speech rhythm and punctuation.
+
+    - Breaks at natural pauses (gaps >= pause_threshold between words)
+    - Breaks after commas, sentence-ending punctuation
+    - Allows up to max_words for fast speech, breaks earlier for slow speech
+    - Always breaks at min_words if punctuation or pause demands it
 
     Returns list of (start, end, text) tuples.
     """
@@ -70,9 +75,10 @@ def split_words_into_cues(
 
     cues = []
     current_words = []
+    current_word_infos = []
     current_start = None
 
-    for word_info in words:
+    for i, word_info in enumerate(words):
         word_text = word_info.word.strip()
         if not word_text:
             continue
@@ -81,23 +87,36 @@ def split_words_into_cues(
             current_start = word_info.start
 
         current_words.append(word_text)
+        current_word_infos.append(word_info)
         current_end = word_info.end
 
-        # Check if we should end the cue
         should_break = False
+        n = len(current_words)
 
-        # Break at max words
-        if len(current_words) >= max_words:
+        # Hard break at max words
+        if n >= max_words:
             should_break = True
 
-        # Also break at sentence-ending punctuation if we have at least 2 words
-        if len(current_words) >= 2 and word_text and word_text[-1] in '.!?':
+        # Break at sentence-ending punctuation (always, even with 1 word)
+        elif word_text[-1] in '.!?':
             should_break = True
+
+        # Break at comma / semicolon / colon if we have enough words
+        elif n >= min_words and word_text[-1] in ',;:':
+            should_break = True
+
+        # Break at natural pause before the *next* word
+        elif n >= min_words and i + 1 < len(words):
+            next_start = words[i + 1].start
+            gap = next_start - current_end
+            if gap >= pause_threshold:
+                should_break = True
 
         if should_break:
             cue_text = " ".join(current_words)
             cues.append((current_start, current_end, cue_text))
             current_words = []
+            current_word_infos = []
             current_start = None
 
     # Handle remaining words
@@ -108,10 +127,32 @@ def split_words_into_cues(
     return cues
 
 
+def close_gaps(cues: List[Tuple[float, float, str]], max_extend: float = 0.5) -> List[Tuple[float, float, str]]:
+    """
+    Extend each cue's end time to meet the next cue's start time,
+    eliminating gaps that cause loose frames. Only extends if the
+    gap is shorter than max_extend seconds to avoid stretching
+    across intentional pauses.
+    """
+    if len(cues) <= 1:
+        return cues
+
+    closed = []
+    for i in range(len(cues) - 1):
+        start, end, text = cues[i]
+        next_start = cues[i + 1][0]
+        gap = next_start - end
+        if 0 < gap <= max_extend:
+            end = next_start
+        closed.append((start, end, text))
+    closed.append(cues[-1])
+    return closed
+
+
 def generate_srt(segments) -> str:
     """
     Generate SRT content from whisper segments with word-level timestamps.
-    Splits into max 3 words per cue with accurate timestamps.
+    Splits into max 3 words per cue with accurate timestamps and no gaps.
     """
     all_words = []
 
@@ -120,6 +161,7 @@ def generate_srt(segments) -> str:
             all_words.extend(segment.words)
 
     all_cues = split_words_into_cues(all_words, max_words=3)
+    all_cues = close_gaps(all_cues)
 
     # Build SRT content
     srt_lines = []
