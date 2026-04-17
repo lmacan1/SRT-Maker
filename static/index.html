@@ -203,8 +203,14 @@
                 });
 
                 if (!response.ok) {
-                    const error = await response.json();
-                    throw new Error(error.detail || 'Transcription failed');
+                    const text = await response.text();
+                    let message;
+                    try {
+                        message = JSON.parse(text).detail;
+                    } catch {
+                        message = text || response.statusText;
+                    }
+                    throw new Error(message || `Transcription failed (HTTP ${response.status})`);
                 }
 
                 // Get the filename from Content-Disposition header

@@ -2,10 +2,14 @@
 SRT-Maker: Web app for transcribing MP3 files to SRT subtitles using faster-whisper.
 """
 import os
+import logging
 import uuid
 import subprocess
 from pathlib import Path
 from typing import List, Tuple
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+logger = logging.getLogger("srt-maker")
 
 VIDEO_EXTENSIONS = ('.mp4', '.mkv', '.webm', '.mov')
 
@@ -43,6 +47,20 @@ def get_model() -> WhisperModel:
         )
         print("Model loaded successfully!")
     return _model
+
+
+def unload_model():
+    """Unload the whisper model to free GPU memory."""
+    global _model
+    if _model is not None:
+        del _model
+        _model = None
+        try:
+            import torch
+            torch.cuda.empty_cache()
+        except ImportError:
+            pass
+        print("Model unloaded, GPU memory freed.")
 
 
 def format_timestamp(seconds: float) -> str:
@@ -244,20 +262,42 @@ async def transcribe(file: UploadFile = File(...)):
             headers={"Content-Disposition": f'attachment; filename="{srt_filename}"'}
         )
 
+    except HTTPException:
+        raise
+    except subprocess.CalledProcessError as e:
+        stderr = e.stderr.decode("utf-8", errors="replace") if e.stderr else ""
+        logger.error("ffmpeg failed for %s: %s", file.filename, stderr)
+        raise HTTPException(
+            status_code=422,
+            detail="Audio extraction failed — the file may be corrupt or in an unsupported codec.",
+        )
+    except RuntimeError as e:
+        message = str(e).lower()
+        if "out of memory" in message or "cuda" in message:
+            logger.error("CUDA error on %s: %s", file.filename, e)
+            raise HTTPException(
+                status_code=507,
+                detail="GPU out of memory — try a shorter file or restart the server.",
+            )
+        logger.exception("transcription runtime error on %s", file.filename)
+        raise HTTPException(status_code=500, detail="Transcription failed — check server logs.")
+    except Exception:
+        logger.exception("unexpected transcription failure on %s", file.filename)
+        raise HTTPException(status_code=500, detail="Transcription failed — check server logs.")
     finally:
         # Clean up temp files
         if temp_audio_path.exists():
             temp_audio_path.unlink()
         if extracted_audio_path and extracted_audio_path.exists():
             extracted_audio_path.unlink()
+        # Free GPU memory after each transcription
+        unload_model()
 
 
 @app.on_event("startup")
 async def startup_event():
-    """Preload the model on startup."""
-    # Preload in background - first request will still be fast
-    import threading
-    threading.Thread(target=get_model, daemon=True).start()
+    """Server started - model loads on first request, not at startup."""
+    print("SRT-Maker ready. Model will load on first transcription request.")
 
 
 if __name__ == "__main__":
