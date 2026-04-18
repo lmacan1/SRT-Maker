@@ -2,6 +2,7 @@
 SRT-Maker: Web app for transcribing MP3 files to SRT subtitles using faster-whisper.
 """
 import os
+import re
 import logging
 import uuid
 import subprocess
@@ -145,32 +146,76 @@ def split_words_into_cues(
     return cues
 
 
-def close_gaps(cues: List[Tuple[float, float, str]], max_extend: float = 0.5) -> List[Tuple[float, float, str]]:
+def detect_silences(path: Path, noise_db: float = -35.0, min_dur: float = 0.15) -> List[Tuple[float, float]]:
+    """Run ffmpeg silencedetect and return list of (silence_start, silence_end) windows."""
+    cmd = [
+        "ffmpeg", "-i", str(path),
+        "-af", f"silencedetect=noise={noise_db}dB:d={min_dur}",
+        "-f", "null", "-",
+    ]
+    proc = subprocess.run(cmd, capture_output=True, text=True)
+    log = proc.stderr
+    starts = [float(m.group(1)) for m in re.finditer(r"silence_start:\s*([0-9.]+)", log)]
+    ends = [float(m.group(1)) for m in re.finditer(r"silence_end:\s*([0-9.]+)", log)]
+    return [(s, e) for s, e in zip(starts, ends + [None] * (len(starts) - len(ends))) if e is not None]
+
+
+def refine_cue_timings(
+    cues: List[Tuple[float, float, str]],
+    silences: List[Tuple[float, float]] = None,
+    end_pad: float = 0.06,
+    start_pad: float = 0.02,
+    snap_window: float = 1.0,
+    pre_silence_margin: float = 0.04,
+) -> List[Tuple[float, float, str]]:
     """
-    Extend each cue's end time to meet the next cue's start time,
-    eliminating gaps that cause loose frames. Only extends if the
-    gap is shorter than max_extend seconds to avoid stretching
-    across intentional pauses.
+    Compensate for whisper word-timestamp drift at cue boundaries.
+
+    Phrase boundary (a detected silence begins after this cue's raw end and
+    before the next cue starts): snap cue end to (silence_start - pre_silence_margin).
+    This fixes whisper's 300-500ms under-shoot on phrase-ending words.
+
+    Mid-phrase: add small end_pad to cover soft trailing consonants, clamped
+    so we never invade the next cue.
     """
-    if len(cues) <= 1:
+    if not cues:
         return cues
+    silences = silences or []
 
-    closed = []
-    for i in range(len(cues) - 1):
-        start, end, text = cues[i]
-        next_start = cues[i + 1][0]
-        gap = next_start - end
-        if 0 < gap <= max_extend:
-            end = next_start
-        closed.append((start, end, text))
-    closed.append(cues[-1])
-    return closed
+    refined = []
+    for i, (start, end, text) in enumerate(cues):
+        new_start = max(0.0, start - start_pad)
+        next_start = cues[i + 1][0] if i + 1 < len(cues) else None
+
+        snap_target = None
+        for s_start, _ in silences:
+            if end <= s_start <= end + snap_window:
+                if next_start is None or s_start < next_start:
+                    snap_target = s_start - pre_silence_margin
+                    break
+
+        if snap_target is not None and snap_target > end:
+            new_end = snap_target
+        else:
+            new_end = end + end_pad
+
+        if next_start is not None and new_end > next_start - 0.01:
+            new_end = max(end, next_start - 0.01)
+
+        if refined and new_start < refined[-1][1]:
+            new_start = refined[-1][1]
+
+        refined.append((new_start, new_end, text))
+    return refined
 
 
-def generate_srt(segments) -> str:
+def generate_srt(segments, audio_path: Path = None) -> str:
     """
     Generate SRT content from whisper segments with word-level timestamps.
-    Splits into max 3 words per cue with accurate timestamps and no gaps.
+    Splits into max 3 words per cue with accurate timestamps.
+
+    If audio_path is provided, runs silence detection to snap phrase-ending
+    cues to true acoustic boundaries.
     """
     all_words = []
 
@@ -179,7 +224,15 @@ def generate_srt(segments) -> str:
             all_words.extend(segment.words)
 
     all_cues = split_words_into_cues(all_words, max_words=3)
-    all_cues = close_gaps(all_cues)
+
+    silences = []
+    if audio_path is not None:
+        try:
+            silences = detect_silences(audio_path)
+        except Exception:
+            logger.exception("silence detection failed, falling back to padding-only refinement")
+
+    all_cues = refine_cue_timings(all_cues, silences=silences)
 
     # Build SRT content
     srt_lines = []
@@ -239,7 +292,8 @@ async def transcribe(file: UploadFile = File(...)):
             word_timestamps=True,
             vad_filter=True,
             vad_parameters=dict(
-                min_silence_duration_ms=500,
+                min_silence_duration_ms=800,
+                speech_pad_ms=200,
             ),
         )
 
@@ -247,8 +301,8 @@ async def transcribe(file: UploadFile = File(...)):
         segments_list = list(segments)
         print(f"Transcription complete: {len(segments_list)} segments, duration {info.duration:.1f}s")
 
-        # Generate SRT content
-        srt_content = generate_srt(segments_list)
+        # Generate SRT content (pass audio path for silence-snap refinement)
+        srt_content = generate_srt(segments_list, audio_path=transcribe_path)
 
         # Save SRT file
         srt_filename = Path(file.filename).stem + ".srt"
