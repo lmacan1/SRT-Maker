@@ -14,6 +14,9 @@ logger = logging.getLogger("srt-maker")
 
 VIDEO_EXTENSIONS = ('.mp4', '.mkv', '.webm', '.mov')
 
+# Preflight: int8_float16 large-v3 weights ~1.5 GB; 2 GB leaves headroom for activations + CUDA context.
+MIN_FREE_VRAM_MIB = 2000
+
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.responses import FileResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
@@ -44,10 +47,42 @@ def get_model() -> WhisperModel:
         _model = WhisperModel(
             "large-v3",
             device="cuda",
-            compute_type="float16"
+            compute_type="int8_float16",
         )
         print("Model loaded successfully!")
     return _model
+
+
+def available_gpu_mib() -> int | None:
+    """MiB usable by this process: free VRAM plus whatever this PID already holds.
+
+    ctranslate2's allocator reuses its pool across requests, so memory attributed
+    to us is reclaimable on the next load — counting it as "available" avoids
+    false-positive preflight rejections after a successful transcription.
+
+    Returns None if nvidia-smi is unavailable; caller should skip the check.
+    """
+    try:
+        free = subprocess.run(
+            ["nvidia-smi", "--query-gpu=memory.free", "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, check=True, timeout=5,
+        )
+        free_mib = int(free.stdout.strip().splitlines()[0])
+
+        apps = subprocess.run(
+            ["nvidia-smi", "--query-compute-apps=pid,used_memory", "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, check=True, timeout=5,
+        )
+        our_pid = str(os.getpid())
+        our_used = 0
+        for line in apps.stdout.splitlines():
+            parts = [p.strip() for p in line.split(",")]
+            if len(parts) == 2 and parts[0] == our_pid:
+                our_used = int(parts[1])
+                break
+        return free_mib + our_used
+    except (subprocess.SubprocessError, ValueError, FileNotFoundError):
+        return None
 
 
 def unload_model():
@@ -258,6 +293,13 @@ async def transcribe(file: UploadFile = File(...)):
     """
     if not file.filename.lower().endswith(('.mp3', '.wav', '.m4a', '.ogg', '.flac', '.mp4', '.mkv', '.webm', '.mov')):
         raise HTTPException(status_code=400, detail="Please upload an audio or video file (MP3, WAV, M4A, OGG, FLAC, MP4, MKV, WebM, MOV)")
+
+    avail = available_gpu_mib()
+    if avail is not None and avail < MIN_FREE_VRAM_MIB:
+        raise HTTPException(
+            status_code=503,
+            detail=f"GPU busy ({avail} MiB available, need {MIN_FREE_VRAM_MIB}). Retry in a minute.",
+        )
 
     # Save uploaded file temporarily
     temp_id = str(uuid.uuid4())
