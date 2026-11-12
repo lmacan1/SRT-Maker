@@ -6,6 +6,8 @@ import re
 import logging
 import uuid
 import subprocess
+import threading
+import asyncio
 from pathlib import Path
 from typing import List, Tuple
 
@@ -20,7 +22,10 @@ MIN_FREE_VRAM_MIB = 2000
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.responses import FileResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
-from faster_whisper import WhisperModel
+from starlette.background import BackgroundTask
+from faster_whisper import WhisperModel, BatchedInferencePipeline
+from concurrent.futures import ThreadPoolExecutor
+import time
 
 app = FastAPI(title="SRT-Maker")
 
@@ -29,28 +34,67 @@ app.mount("/static", StaticFiles(directory="static"), name="static")
 
 # Initialize model lazily
 _model = None
+_pipeline = None
+
+MAX_UPLOAD_BYTES = 2 * 1024**3      # reject absurd uploads early
+FFMPEG_TIMEOUT = 600                # seconds
+STALE_FILE_AGE = 3600               # sweep orphaned uploads older than this
+UPLOAD_DIR = Path("uploads")
+UPLOAD_DIR.mkdir(exist_ok=True)
 
 def extract_audio(video_path: Path, output_path: Path) -> None:
     """Extract audio from video file using ffmpeg."""
     subprocess.run([
         'ffmpeg', '-i', str(video_path),
-        '-vn', '-acodec', 'libmp3lame', '-q:a', '2',
+        '-vn', '-ac', '1', '-ar', '16000', '-c:a', 'pcm_s16le',
         '-y', str(output_path)
-    ], check=True, capture_output=True)
+    ], check=True, capture_output=True, timeout=FFMPEG_TIMEOUT)
+
+
+_model_lock = threading.Lock()   # serializes GPU work
+_idle_timer = None
+IDLE_UNLOAD_SECONDS = 90         # keep model warm between requests, free VRAM when idle
 
 
 def get_model() -> WhisperModel:
-    """Load the whisper model (lazy initialization)."""
+    """Load the whisper model (lazy initialization). Caller must hold _model_lock."""
     global _model
     if _model is None:
         print("Loading faster-whisper large-v3 model with CUDA...")
-        _model = WhisperModel(
-            "large-v3",
-            device="cuda",
-            compute_type="int8_float16",
-        )
+        try:
+            # Skip the HuggingFace network round-trip when already cached
+            _model = WhisperModel("large-v3", device="cuda",
+                                  compute_type="int8_float16", local_files_only=True)
+        except Exception:
+            _model = WhisperModel("large-v3", device="cuda", compute_type="int8_float16")
         print("Model loaded successfully!")
     return _model
+
+
+def get_pipeline() -> BatchedInferencePipeline:
+    """Batched wrapper around the model (~2.5x faster on long audio). Hold _model_lock."""
+    global _pipeline
+    model = get_model()
+    if _pipeline is None:
+        _pipeline = BatchedInferencePipeline(model)
+    return _pipeline
+
+
+def _schedule_idle_unload():
+    global _idle_timer
+    if _idle_timer is not None:
+        _idle_timer.cancel()
+
+    def _unload():
+        if _model_lock.acquire(blocking=False):
+            try:
+                unload_model()
+            finally:
+                _model_lock.release()
+
+    _idle_timer = threading.Timer(IDLE_UNLOAD_SECONDS, _unload)
+    _idle_timer.daemon = True
+    _idle_timer.start()
 
 
 def available_gpu_mib() -> int | None:
@@ -87,10 +131,13 @@ def available_gpu_mib() -> int | None:
 
 def unload_model():
     """Unload the whisper model to free GPU memory."""
-    global _model
+    global _model, _pipeline
     if _model is not None:
+        _pipeline = None
         del _model
         _model = None
+        import gc
+        gc.collect()
         try:
             import torch
             torch.cuda.empty_cache()
@@ -106,6 +153,12 @@ def format_timestamp(seconds: float) -> str:
     secs = int(seconds % 60)
     millis = int((seconds - int(seconds)) * 1000)
     return f"{hours:02d}:{minutes:02d}:{secs:02d},{millis:03d}"
+
+
+def _strip_hyphens(text: str) -> str:
+    """Turn 'three-step' into 'three step'; drop stray dashes."""
+    text = re.sub(r"[-\u2010\u2011\u2012\u2013\u2014]+", " ", text)
+    return " ".join(text.split())
 
 
 def split_words_into_cues(
@@ -133,7 +186,7 @@ def split_words_into_cues(
     current_start = None
 
     for i, word_info in enumerate(words):
-        word_text = word_info.word.strip()
+        word_text = _strip_hyphens(word_info.word.strip())
         if not word_text:
             continue
 
@@ -188,7 +241,7 @@ def detect_silences(path: Path, noise_db: float = -35.0, min_dur: float = 0.15) 
         "-af", f"silencedetect=noise={noise_db}dB:d={min_dur}",
         "-f", "null", "-",
     ]
-    proc = subprocess.run(cmd, capture_output=True, text=True)
+    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=FFMPEG_TIMEOUT)
     log = proc.stderr
     starts = [float(m.group(1)) for m in re.finditer(r"silence_start:\s*([0-9.]+)", log)]
     ends = [float(m.group(1)) for m in re.finditer(r"silence_end:\s*([0-9.]+)", log)]
@@ -244,13 +297,23 @@ def refine_cue_timings(
     return refined
 
 
-def generate_srt(segments, audio_path: Path = None) -> str:
+_cpu_pool = ThreadPoolExecutor(max_workers=4)
+
+
+def _safe_silences(path: Path) -> List[Tuple[float, float]]:
+    try:
+        return detect_silences(path)
+    except Exception:
+        logger.exception("silence detection failed, falling back to padding-only refinement")
+        return []
+
+
+def generate_srt(segments, silences: List[Tuple[float, float]] = None) -> str:
     """
     Generate SRT content from whisper segments with word-level timestamps.
     Splits into max 3 words per cue with accurate timestamps.
 
-    If audio_path is provided, runs silence detection to snap phrase-ending
-    cues to true acoustic boundaries.
+    If silences are provided, phrase-ending cues snap to true acoustic boundaries.
     """
     all_words = []
 
@@ -259,13 +322,6 @@ def generate_srt(segments, audio_path: Path = None) -> str:
             all_words.extend(segment.words)
 
     all_cues = split_words_into_cues(all_words, max_words=3)
-
-    silences = []
-    if audio_path is not None:
-        try:
-            silences = detect_silences(audio_path)
-        except Exception:
-            logger.exception("silence detection failed, falling back to padding-only refinement")
 
     all_cues = refine_cue_timings(all_cues, silences=silences)
 
@@ -301,98 +357,144 @@ async def transcribe(file: UploadFile = File(...)):
             detail=f"GPU busy ({avail} MiB available, need {MIN_FREE_VRAM_MIB}). Retry in a minute.",
         )
 
-    # Save uploaded file temporarily
     temp_id = str(uuid.uuid4())
-    temp_audio_path = Path("uploads") / f"{temp_id}_{file.filename}"
-
+    safe_name = Path(file.filename).name
+    temp_audio_path = Path("uploads") / f"{temp_id}_input{Path(safe_name).suffix.lower()}"
     extracted_audio_path = None
+    srt_path = None
+    handed_off = False
 
     try:
-        # Write uploaded file to disk
-        content = await file.read()
-        temp_audio_path.write_bytes(content)
+        with open(temp_audio_path, "wb") as out:
+            size = 0
+            while chunk := await file.read(1024 * 1024):
+                size += len(chunk)
+                if size > MAX_UPLOAD_BYTES:
+                    raise HTTPException(status_code=413, detail="File too large (max 2 GB).")
+                out.write(chunk)
 
-        # Extract audio if it's a video file
-        transcribe_path = temp_audio_path
-        if file.filename.lower().endswith(VIDEO_EXTENSIONS):
-            print(f"Extracting audio from: {file.filename}")
-            extracted_audio_path = Path("uploads") / f"{temp_id}_extracted.mp3"
-            extract_audio(temp_audio_path, extracted_audio_path)
-            transcribe_path = extracted_audio_path
-            print("Audio extraction complete")
+        srt_filename = Path(safe_name).stem + ".srt"
+        srt_path = Path("uploads") / f"{temp_id}.srt"
+        if safe_name.lower().endswith(VIDEO_EXTENSIONS):
+            extracted_audio_path = Path("uploads") / f"{temp_id}_extracted.wav"
 
-        # Load model and transcribe
-        model = get_model()
-
-        print(f"Transcribing: {file.filename}")
-        segments, info = model.transcribe(
-            str(transcribe_path),
-            language="en",
-            beam_size=5,
-            best_of=5,
-            temperature=0,
-            word_timestamps=True,
-            vad_filter=True,
-            vad_parameters=dict(
-                min_silence_duration_ms=800,
-                speech_pad_ms=200,
-            ),
+        # Blocking ffmpeg/GPU work runs off the event loop
+        await asyncio.to_thread(
+            _process, safe_name, temp_audio_path, extracted_audio_path, srt_path
         )
 
-        # Collect all segments (generator needs to be consumed)
-        segments_list = list(segments)
-        print(f"Transcription complete: {len(segments_list)} segments, duration {info.duration:.1f}s")
-
-        # Generate SRT content (pass audio path for silence-snap refinement)
-        srt_content = generate_srt(segments_list, audio_path=transcribe_path)
-
-        # Save SRT file
-        srt_filename = Path(file.filename).stem + ".srt"
-        srt_path = Path("uploads") / f"{temp_id}_{srt_filename}"
-        srt_path.write_text(srt_content, encoding="utf-8")
-
+        handed_off = True
+        # Starlette builds a correct RFC 5987 Content-Disposition (UTF-8 safe) from filename=
         return FileResponse(
             path=str(srt_path),
             filename=srt_filename,
             media_type="application/x-subrip",
-            headers={"Content-Disposition": f'attachment; filename="{srt_filename}"'}
+            background=BackgroundTask(_cleanup, srt_path),
         )
 
     except HTTPException:
         raise
     except subprocess.CalledProcessError as e:
         stderr = e.stderr.decode("utf-8", errors="replace") if e.stderr else ""
-        logger.error("ffmpeg failed for %s: %s", file.filename, stderr)
+        logger.error("ffmpeg failed for %s: %s", safe_name, stderr)
         raise HTTPException(
             status_code=422,
             detail="Audio extraction failed — the file may be corrupt or in an unsupported codec.",
         )
+    except subprocess.TimeoutExpired:
+        logger.error("ffmpeg timed out for %s", safe_name)
+        raise HTTPException(status_code=504, detail="Audio processing timed out.")
     except RuntimeError as e:
         message = str(e).lower()
         if "out of memory" in message or "cuda" in message:
-            logger.error("CUDA error on %s: %s", file.filename, e)
+            logger.error("CUDA error on %s: %s", safe_name, e)
             raise HTTPException(
                 status_code=507,
                 detail="GPU out of memory — try a shorter file or restart the server.",
             )
-        logger.exception("transcription runtime error on %s", file.filename)
+        logger.exception("transcription runtime error on %s", safe_name)
         raise HTTPException(status_code=500, detail="Transcription failed — check server logs.")
     except Exception:
-        logger.exception("unexpected transcription failure on %s", file.filename)
+        logger.exception("unexpected transcription failure on %s", safe_name)
         raise HTTPException(status_code=500, detail="Transcription failed — check server logs.")
     finally:
-        # Clean up temp files
-        if temp_audio_path.exists():
-            temp_audio_path.unlink()
-        if extracted_audio_path and extracted_audio_path.exists():
-            extracted_audio_path.unlink()
-        # Free GPU memory after each transcription
-        unload_model()
+        _cleanup(temp_audio_path, extracted_audio_path)
+        if not handed_off:
+            _cleanup(srt_path)
+
+
+def _cleanup(*paths):
+    for p in paths:
+        if p is not None:
+            try:
+                Path(p).unlink(missing_ok=True)
+            except OSError:
+                pass
+
+
+def _process(name: str, input_path: Path, extracted_path, srt_path: Path) -> None:
+    """Blocking pipeline: (extract) -> transcribe -> write SRT."""
+    transcribe_path = input_path
+    if extracted_path is not None:
+        print(f"Extracting audio from: {name}")
+        extract_audio(input_path, extracted_path)
+        transcribe_path = extracted_path
+
+    # Silence detection is CPU-only: overlap it with the GPU transcription
+    silence_future = _cpu_pool.submit(_safe_silences, transcribe_path)
+
+    with _model_lock:
+        if _idle_timer is not None:
+            _idle_timer.cancel()
+        try:
+            model = get_pipeline()
+            print(f"Transcribing: {name}")
+            segments, info = model.transcribe(
+                str(transcribe_path),
+                language="en",
+                beam_size=5,
+                temperature=0,
+                word_timestamps=True,
+                batch_size=16,
+                vad_filter=True,
+                vad_parameters=dict(min_silence_duration_ms=800, speech_pad_ms=200),
+            )
+            segments_list = list(segments)
+            print(f"Transcription complete: {len(segments_list)} segments, duration {info.duration:.1f}s")
+        except BaseException:
+            unload_model()  # recover VRAM after a failure
+            raise
+        _schedule_idle_unload()
+
+    srt_path.write_text(generate_srt(segments_list, silences=silence_future.result()), encoding="utf-8")
+
+
+def sweep_stale_files(max_age: float = STALE_FILE_AGE) -> None:
+    """Delete orphaned temp/output files (crash leftovers) older than max_age."""
+    now = time.time()
+    for p in UPLOAD_DIR.iterdir():
+        try:
+            if p.is_file() and not p.name.startswith("_") and now - p.stat().st_mtime > max_age:
+                p.unlink()
+        except OSError:
+            pass
+
+
+@app.get("/health")
+async def health():
+    return {"status": "ok", "model_loaded": _model is not None}
+
+
+async def _sweeper():
+    while True:
+        await asyncio.to_thread(sweep_stale_files)
+        await asyncio.sleep(900)
 
 
 @app.on_event("startup")
 async def startup_event():
     """Server started - model loads on first request, not at startup."""
+    app.state.sweeper = asyncio.create_task(_sweeper())
     print("SRT-Maker ready. Model will load on first transcription request.")
 
 
